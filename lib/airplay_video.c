@@ -1122,23 +1122,30 @@ char *adjust_master_playlist (char *fcup_response_data, int fcup_response_datale
     return new_master;
 }
 
-char *adjust_yt_condensed_playlist(const char *media_playlist) {
-/* this copies a Media Playlist into a null-terminated string. 
-   If it has the "#YT-EXT-CONDENSED-URI" header, it is also expanded into 
-   the full Media Playlist format.
-   It  returns a pointer to the expanded playlist, WHICH MUST BE FREED AFTER USE */
+char *adjust_yt_condensed_playlist(const char *media_playlist, int n_chunks) {
+    /* this copies a Media Playlist of n_chunks segments into a null-terminated string. 
+    If it has the "#YT-EXT-CONDENSED-URI" header, it is also expanded into 
+    the full Media Playlist format.
+    It  returns a pointer to the expanded playlist, WHICH MUST BE FREED AFTER USE */
 
-    const char *base_uri_begin;
-    const char *params_begin;
-    const char *prefix_begin;
-    size_t base_uri_len;
-    size_t params_len;
-    size_t prefix_len;
-    const char* ptr = strstr(media_playlist, "#EXTM3U\n");
-
-    ptr += strlen("#EXTM3U\n");
-    assert(ptr);
-    if (strncmp(ptr, "#YT-EXT-CONDENSED-URL", strlen("#YT-EXT-CONDENSED-URL"))) {
+    const char *extinf = "#EXTINF:";
+    const char *first_chunk = NULL;
+    const char *ptr = NULL;
+    const char *yt = NULL;
+    if (n_chunks > 0) {
+        first_chunk = strstr(media_playlist, extinf);
+        assert(first_chunk);
+        ptr = media_playlist;
+        while (ptr < first_chunk) {
+            if (!strncmp(ptr, "#YT-EXT-CONDENSED-URL", strlen("#YT-EXT-CONDENSED-URL"))) {
+                yt = ptr;
+                break;
+            }
+            ptr++;
+        }
+    }
+    if (!yt) {
+        /* no YT_CONDENSED_URI's to expand: return unchanged copy of media playlist */
         size_t len = strlen(media_playlist);
         char * playlist_copy = (char *) malloc(len + 1);
         if (!playlist_copy) {
@@ -1149,7 +1156,16 @@ char *adjust_yt_condensed_playlist(const char *media_playlist) {
         playlist_copy[len] = '\0';
         return playlist_copy;
     }
-    ptr = strstr(ptr, "BASE-URI=");
+
+    /* extract YT_CONDENSED_URI parameters */
+    const char *base_uri_begin;
+    const char *params_begin;
+    const char *prefix_begin;
+
+    size_t base_uri_len;
+    size_t params_len;
+    size_t prefix_len;
+    ptr = strstr(yt, "BASE-URI=");
     base_uri_begin = strchr(ptr, '"');
     base_uri_begin++;
     ptr = strchr(base_uri_begin, '"');
@@ -1174,6 +1190,7 @@ char *adjust_yt_condensed_playlist(const char *media_playlist) {
     prefix_len = ptr - prefix_begin;
     char *prefix = (char *) calloc(prefix_len + 1, sizeof(char));
     assert(prefix);
+    assert(prefix_len == 2);
     memcpy(prefix, prefix_begin, prefix_len);  //must free
 
     /* expand params */
@@ -1209,16 +1226,10 @@ char *adjust_yt_condensed_playlist(const char *media_playlist) {
         }
     }
 
-    int count = 0;
-    ptr = strstr(media_playlist, "#EXTINF");
-    while (ptr) {
-        count++;
-        ptr = strstr(++ptr, "#EXTINF");
-    }
-
+    /* chunks is the number of media segments to process */
     size_t old_size = strlen(media_playlist);
     size_t new_len = old_size;
-    new_len += count * (base_uri_len + params_len);
+    new_len += n_chunks * (base_uri_len + params_len);
 
     char * new_playlist = (char *) malloc(new_len + 1);
     if (!new_playlist) {
@@ -1226,67 +1237,70 @@ char *adjust_yt_condensed_playlist(const char *media_playlist) {
         exit(1);
     }
     new_playlist[new_len] = '\0';
+
     const char *old_pos = media_playlist;
     char *new_pos = new_playlist;
-    ptr = old_pos;
-    ptr = strstr(old_pos, "#EXTINF:");
-    size_t len = ptr - old_pos;
+    size_t len = first_chunk - old_pos;
     /* copy header section before chunks */
+    int written = len;
+    assert(written <= new_len);
     memcpy(new_pos, old_pos, len);
     old_pos += len;
     new_pos += len;
-    while (ptr) {
+    int count = 0;
+    while (count < n_chunks) {
+        count++;
         /* for each chunk */
-        const char *end = NULL;
-        const char *start = strstr(ptr, prefix);
-        len = start - ptr;
+        const char *start = strstr(old_pos, prefix);
+        assert(start);
+        len = start - old_pos;
         /* copy first line of chunk entry */
+        written += len;
+        assert(written <= new_len);
         memcpy(new_pos, old_pos, len);
         old_pos += len;
         new_pos += len;
-	
-	    /* copy base uri  to replace prefix*/
+
+        /* copy base uri + '/'  to replace prefix*/
+        written += base_uri_len;
+        assert(written <= new_len);	
         memcpy(new_pos, base_uri, base_uri_len);
         new_pos += base_uri_len;
+        written += 1;
+        assert(written <= new_len);		
+        *new_pos = '/';
+        new_pos++;
         old_pos += prefix_len;
-        ptr = strstr(old_pos, "#EXTINF:");
 
         /* insert the PARAMS separators on the slices line  */
-        end = old_pos;
         int last = nparams - 1;
         for (int i = 0; i < nparams; i++) {
+            const char *end = old_pos;
             if (i != last) {
                 end = strchr(end, '/');
+                end++;
+            } else if (count < n_chunks) {
+                end = strstr(end, extinf);
             } else {
-                /* the next line starts with either #EXTINF (usually) 
-                or #EXT-X-ENDLIST (at last chunk)*/
-	            end = strstr(end, "#EXT");
+                end = media_playlist + strlen(media_playlist);
             }
-            *new_pos = '/';
-            new_pos++;
+            written += params_size[i] + 1;
+            assert(written <= new_len);
             memcpy(new_pos, params_start[i], params_size[i]);
             new_pos += params_size[i];
             *new_pos = '/';
             new_pos++;
-
             len = end - old_pos;
-            end++;
-
+            written += len;
+            assert(written <= new_len);
             memcpy (new_pos, old_pos, len);
             new_pos += len;
             old_pos += len;
-            if (i != last) {
-                old_pos++; /* last entry is not followed by "/" separator */
-            }
         }
     }
-    /* copy tail */
-     
-    len = media_playlist + strlen(media_playlist) - old_pos;
-    memcpy(new_pos, old_pos, len);
-    new_pos += len;
-    old_pos += len;
-
+    assert (count == n_chunks);
+    assert (written == new_len);
+ 
     free (prefix);
     free (base_uri);
     free (params);
